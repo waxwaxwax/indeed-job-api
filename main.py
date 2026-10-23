@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -25,112 +26,201 @@ from fastapi.security import (
     HTTPBearer,
     HTTPAuthorizationCredentials,
 )
-from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
+from sqlalchemy import (
+    create_engine,
+    text,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 
 # ==========================================
-# 1. ファイル・フォルダ設定
+# 1. 環境変数
 # ==========================================
 
 BASE_DIR = Path(__file__).resolve().parent
+
 load_dotenv(BASE_DIR / ".env")
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 READ_TOKEN = os.getenv("READ_TOKEN", "")
+
 OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET", "")
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv(
-    "ALLOWED_ORIGINS", "http://127.0.0.1:5500,http://localhost:5500"
-).split(",") if origin.strip()]
 
-if not ADMIN_TOKEN or not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
-    raise RuntimeError(".env に ADMIN_TOKEN、OAUTH_CLIENT_ID、OAUTH_CLIENT_SECRET を設定してください")
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        (
+            "http://127.0.0.1:5500,"
+            "http://localhost:5500,"
+            "https://agreeable-coast-0f1a24f10.6.azurestaticapps.net"
+        ),
+    ).split(",")
+    if origin.strip()
+]
 
-DB_PATH = BASE_DIR / "jobs.db"
+if not ADMIN_TOKEN:
+    raise RuntimeError(
+        "ADMIN_TOKENを環境変数に設定してください"
+    )
+
+if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+    raise RuntimeError(
+        "OAUTH_CLIENT_IDとOAUTH_CLIENT_SECRETを設定してください"
+    )
+
+
+# ==========================================
+# 2. データベース設定
+# ==========================================
+
+# DATABASE_URLが未設定ならローカルSQLiteを使用
+DEFAULT_SQLITE_PATH = BASE_DIR / "jobs.db"
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    f"sqlite:///{DEFAULT_SQLITE_PATH}",
+)
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql+psycopg://",
+        1,
+    )
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgresql://",
+        "postgresql+psycopg://",
+        1,
+    )
+
+IS_SQLITE = DATABASE_URL.startswith("sqlite:")
+
+connect_args = {}
+
+if IS_SQLITE:
+    connect_args["check_same_thread"] = False
+
+engine: Engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args=connect_args,
+)
+
+
+# ==========================================
+# 3. ログ設定
+# ==========================================
 
 LOG_DIR = BASE_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 LOG_PATH = LOG_DIR / "api.log"
 
-
-# ==========================================
-# 2. ログ設定
-# ==========================================
-
 logger = logging.getLogger("job_api")
+
 logger.setLevel(logging.INFO)
 logger.propagate = False
 
-# 再読み込み時のハンドラー重複を防ぐ
 if not logger.handlers:
 
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s"
     )
 
-    # ログファイルへ保存
-    file_handler = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-
-    # ターミナルにも表示
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
+    # ローカル環境ではファイルにも記録
+    # Azureでは標準出力のログを利用
+    if os.getenv("ENABLE_FILE_LOG", "false").lower() == "true":
+
+        file_handler = RotatingFileHandler(
+            LOG_PATH,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
 
 # ==========================================
-# 3. SQLiteデータベース
+# 4. データベース初期化
 # ==========================================
-
-def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 
 def initialize_database():
-    with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                location TEXT NOT NULL,
-                salary INTEGER NOT NULL
-            )
-        """)
+
+    with engine.begin() as conn:
+
+        if IS_SQLITE:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    salary INTEGER NOT NULL
+                )
+            """))
+
+        else:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    location TEXT NOT NULL,
+                    salary INTEGER NOT NULL
+                )
+            """))
+
+    logger.info("event=database_initialized")
 
 
 # ==========================================
-# 4. FastAPIアプリケーション
+# 5. FastAPIアプリ
 # ==========================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     initialize_database()
+
     logger.info("event=server_started")
+
     yield
+
+    engine.dispose()
+
     logger.info("event=server_stopped")
 
 
 app = FastAPI(
-    title="求人管理API",
-    description="Indeed Technical Analyst面接対策用のAPI",
-    version="1.4.0",
+    title="Indeed Job API - Database Demo",
+    description=(
+        "SQLite / PostgreSQL対応の求人管理API。"
+        "Indeed Technical Analyst面接対策用。"
+    ),
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
-# CORS: FastAPIアプリ生成後に登録する
+# ==========================================
+# 6. CORS
+# ==========================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -141,7 +231,7 @@ app.add_middleware(
 
 
 # ==========================================
-# 5. HTTPアクセスログ
+# 7. アクセスログ
 # ==========================================
 
 @app.middleware("http")
@@ -149,20 +239,19 @@ async def access_log_middleware(
     request: Request,
     call_next,
 ):
+
     request_id = str(uuid.uuid4())
+
     request.state.request_id = request_id
 
     start_time = time.perf_counter()
 
-    method = request.method
-    path = request.url.path
-
     try:
+
         response = await call_next(request)
 
     except Exception:
-        # 予期しない内部エラー
-        # 詳細な例外や秘密情報はログに出さない
+
         duration_ms = (
             time.perf_counter() - start_time
         ) * 1000
@@ -172,8 +261,8 @@ async def access_log_middleware(
             "status=500 duration_ms=%.2f "
             "error=internal_server_error",
             request_id,
-            method,
-            path,
+            request.method,
+            request.url.path,
             duration_ms,
         )
 
@@ -189,8 +278,8 @@ async def access_log_middleware(
         "request_id=%s method=%s path=%s "
         "status=%s duration_ms=%.2f",
         request_id,
-        method,
-        path,
+        request.method,
+        request.url.path,
         response.status_code,
         duration_ms,
     )
@@ -199,7 +288,7 @@ async def access_log_middleware(
 
 
 # ==========================================
-# 6. HTTPエラーのログ
+# 8. HTTPエラーハンドラー
 # ==========================================
 
 @app.exception_handler(HTTPException)
@@ -207,35 +296,17 @@ async def http_exception_handler(
     request: Request,
     exc: HTTPException,
 ):
+
     request_id = getattr(
         request.state,
         "request_id",
         "unknown",
     )
 
-    # エラー内容はあらかじめ定義した
-    # 短いコードに変換して記録する
-    error_codes = {
-        400: "bad_request",
-        401: "unauthorized",
-        403: "forbidden",
-        404: "not_found",
-        405: "method_not_allowed",
-        422: "validation_error",
-        429: "too_many_requests",
-    }
-
-    error_code = error_codes.get(
-        exc.status_code,
-        "http_error",
-    )
-
     logger.warning(
-        "request_id=%s event=http_error "
-        "status=%s error=%s",
+        "request_id=%s event=http_error status=%s",
         request_id,
         exc.status_code,
-        error_code,
     )
 
     return JSONResponse(
@@ -245,39 +316,26 @@ async def http_exception_handler(
     )
 
 
-# ==========================================
-# 7. 入力検証エラーのログ
-# ==========================================
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ):
-    request_id = getattr(
-        request.state,
-        "request_id",
-        "unknown",
-    )
 
-    # 入力値そのものはログに記録しない
     logger.warning(
-        "request_id=%s event=validation_error "
-        "status=422",
-        request_id,
+        "request_id=%s event=validation_error status=422",
+        getattr(request.state, "request_id", "unknown"),
     )
 
-    # Pydanticのエラーに含まれる入力値を
-    # レスポンスへ露出しないよう除去する
     safe_errors = []
 
     for error in exc.errors():
-        safe_error = {
+
+        safe_errors.append({
             key: value
             for key, value in error.items()
             if key not in ("input", "ctx", "url")
-        }
-        safe_errors.append(safe_error)
+        })
 
     return JSONResponse(
         status_code=422,
@@ -286,12 +344,13 @@ async def validation_exception_handler(
 
 
 # ==========================================
-# 8. 求人データモデル
+# 9. データモデル
 # ==========================================
 
 class JobInput(BaseModel):
-    title: str = Field(min_length=1)
-    location: str = Field(min_length=1)
+
+    title: str = Field(min_length=1, max_length=200)
+    location: str = Field(min_length=1, max_length=200)
     salary: int = Field(ge=0)
 
 
@@ -300,22 +359,13 @@ class Job(JobInput):
 
 
 # ==========================================
-# 9. ホーム
+# 10. 認証
 # ==========================================
 
-@app.get("/")
-def home():
-    return {
-        "message": "求人管理APIが動作しています",
-        "version": "1.4.0",
-    }
+API_TOKENS = {
+    ADMIN_TOKEN: "admin",
+}
 
-
-# ==========================================
-# 15. 固定トークン（学習用）
-# ==========================================
-
-API_TOKENS = {ADMIN_TOKEN: "admin"}
 if READ_TOKEN and READ_TOKEN != ADMIN_TOKEN:
     API_TOKENS[READ_TOKEN] = "read"
 
@@ -325,66 +375,141 @@ security = HTTPBearer(
 )
 
 
-# ==========================================
-# 16. 固定トークン認証
-# ==========================================
-
 def verify_token(
     credentials: HTTPAuthorizationCredentials | None = Depends(
         security
     ),
 ):
+
     if credentials is None:
         raise HTTPException(
             status_code=401,
-            detail="アクセストークンがありません、または形式が正しくありません",
+            detail="アクセストークンがありません",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     token = credentials.credentials
 
-    if token not in API_TOKENS:
+    role = None
+
+    for stored_token, stored_role in API_TOKENS.items():
+
+        if secrets.compare_digest(
+            token,
+            stored_token,
+        ):
+            role = stored_role
+            break
+
+    if role is None:
         raise HTTPException(
             status_code=401,
             detail="無効なアクセストークンです",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return API_TOKENS[token]
+    return role
 
 
+def require_admin(
+    role: str = Depends(verify_token),
+):
 
-def require_admin(role: str = Depends(verify_token)):
     if role != "admin":
-        raise HTTPException(status_code=403, detail="書き込み権限がありません")
+        raise HTTPException(
+            status_code=403,
+            detail="書き込み権限がありません",
+        )
+
     return role
 
 
 # ==========================================
-# 10. 求人一覧取得
+# 11. ホーム
 # ==========================================
 
-@app.get("/jobs", response_model=list[Job])
+@app.get("/")
+def home():
+
+    return {
+        "message": "求人管理APIが動作しています",
+        "version": "2.0.0",
+        "database": (
+            "SQLite" if IS_SQLITE else "PostgreSQL"
+        ),
+    }
+
+
+# ==========================================
+# 12. ヘルスチェック
+# ==========================================
+
+@app.get("/health")
+def health():
+
+    try:
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+
+        return {
+            "status": "ok",
+            "database": "connected",
+        }
+
+    except SQLAlchemyError:
+
+        logger.error(
+            "event=database_health_check_failed"
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail="データベースに接続できません",
+        )
+
+
+# ==========================================
+# 13. 求人一覧
+# ==========================================
+
+@app.get(
+    "/jobs",
+    response_model=list[Job],
+)
 def list_jobs():
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM jobs ORDER BY id"
-        ).fetchall()
+
+    with engine.connect() as conn:
+
+        rows = conn.execute(text("""
+            SELECT id, title, location, salary
+            FROM jobs
+            ORDER BY id
+        """)).mappings().all()
 
     return [dict(row) for row in rows]
 
 
 # ==========================================
-# 11. 求人1件取得
+# 14. 求人詳細
 # ==========================================
 
-@app.get("/jobs/{job_id}", response_model=Job)
+@app.get(
+    "/jobs/{job_id}",
+    response_model=Job,
+)
 def get_job(job_id: int):
-    with get_connection() as conn:
+
+    with engine.connect() as conn:
+
         row = conn.execute(
-            "SELECT * FROM jobs WHERE id = ?",
-            (job_id,),
-        ).fetchone()
+            text("""
+                SELECT id, title, location, salary
+                FROM jobs
+                WHERE id = :job_id
+            """),
+            {"job_id": job_id},
+        ).mappings().first()
 
     if row is None:
         raise HTTPException(
@@ -396,28 +521,43 @@ def get_job(job_id: int):
 
 
 # ==========================================
-# 12. 求人登録
+# 15. 求人登録
 # ==========================================
 
-@app.post(
-    "/jobs",
-    response_model=Job,
-    status_code=201,
-)
-def create_job(job: JobInput, _role: str = Depends(require_admin)):
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO jobs (title, location, salary)
-            VALUES (?, ?, ?)
-            """,
-            (
-                job.title,
-                job.location,
-                job.salary,
-            ),
-        )
-        job_id = cursor.lastrowid
+def insert_job(job: JobInput):
+
+    with engine.begin() as conn:
+
+        if IS_SQLITE:
+
+            result = conn.execute(
+                text("""
+                    INSERT INTO jobs (
+                        title, location, salary
+                    )
+                    VALUES (
+                        :title, :location, :salary
+                    )
+                """),
+                job.model_dump(),
+            )
+
+            job_id = result.lastrowid
+
+        else:
+
+            job_id = conn.execute(
+                text("""
+                    INSERT INTO jobs (
+                        title, location, salary
+                    )
+                    VALUES (
+                        :title, :location, :salary
+                    )
+                    RETURNING id
+                """),
+                job.model_dump(),
+            ).scalar_one()
 
     return Job(
         id=job_id,
@@ -425,28 +565,53 @@ def create_job(job: JobInput, _role: str = Depends(require_admin)):
     )
 
 
+@app.post(
+    "/jobs",
+    response_model=Job,
+    status_code=201,
+)
+def create_job(
+    job: JobInput,
+    _role: str = Depends(require_admin),
+):
+
+    return insert_job(job)
+
+
 # ==========================================
-# 13. 求人更新
+# 16. 求人更新
 # ==========================================
 
-@app.put("/jobs/{job_id}", response_model=Job)
-def update_job(job_id: int, job: JobInput, _role: str = Depends(require_admin)):
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE jobs
-            SET title = ?, location = ?, salary = ?
-            WHERE id = ?
-            """,
-            (
-                job.title,
-                job.location,
-                job.salary,
-                job_id,
-            ),
+@app.put(
+    "/jobs/{job_id}",
+    response_model=Job,
+)
+def update_job(
+    job_id: int,
+    job: JobInput,
+    _role: str = Depends(require_admin),
+):
+
+    params = {
+        **job.model_dump(),
+        "job_id": job_id,
+    }
+
+    with engine.begin() as conn:
+
+        result = conn.execute(
+            text("""
+                UPDATE jobs
+                SET
+                    title = :title,
+                    location = :location,
+                    salary = :salary
+                WHERE id = :job_id
+            """),
+            params,
         )
 
-        if cursor.rowcount == 0:
+        if result.rowcount == 0:
             raise HTTPException(
                 status_code=404,
                 detail="求人が見つかりません",
@@ -459,18 +624,26 @@ def update_job(job_id: int, job: JobInput, _role: str = Depends(require_admin)):
 
 
 # ==========================================
-# 14. 求人削除
+# 17. 求人削除
 # ==========================================
 
 @app.delete("/jobs/{job_id}")
-def delete_job(job_id: int, _role: str = Depends(require_admin)):
-    with get_connection() as conn:
-        cursor = conn.execute(
-            "DELETE FROM jobs WHERE id = ?",
-            (job_id,),
+def delete_job(
+    job_id: int,
+    _role: str = Depends(require_admin),
+):
+
+    with engine.begin() as conn:
+
+        result = conn.execute(
+            text("""
+                DELETE FROM jobs
+                WHERE id = :job_id
+            """),
+            {"job_id": job_id},
         )
 
-        if cursor.rowcount == 0:
+        if result.rowcount == 0:
             raise HTTPException(
                 status_code=404,
                 detail="求人が見つかりません",
@@ -482,7 +655,7 @@ def delete_job(job_id: int, _role: str = Depends(require_admin)):
 
 
 # ==========================================
-# 17. 固定トークン認証付き求人取得
+# 18. 認証付き求人一覧
 # ==========================================
 
 @app.get(
@@ -492,6 +665,7 @@ def delete_job(job_id: int, _role: str = Depends(require_admin)):
 def get_secure_jobs(
     role: str = Depends(verify_token),
 ):
+
     if role != "admin":
         raise HTTPException(
             status_code=403,
@@ -502,16 +676,16 @@ def get_secure_jobs(
 
 
 # ==========================================
-# 18. OAuth 2.0学習用設定
+# 19. OAuth 2.0 学習用設定
 # ==========================================
-
-# ローカル学習専用の設定です。
-# 本番用OAuth認可サーバーではありません。
 
 OAUTH_CLIENTS = {
     OAUTH_CLIENT_ID: {
         "secret": OAUTH_CLIENT_SECRET,
-        "scopes": {"jobs.read", "jobs.write"},
+        "scopes": {
+            "jobs.read",
+            "jobs.write",
+        },
     }
 }
 
@@ -521,7 +695,7 @@ TOKEN_LIFETIME_SECONDS = 120
 
 
 # ==========================================
-# 19. アクセストークン発行
+# 20. OAuth学習用トークン発行
 # ==========================================
 
 @app.post("/token")
@@ -531,6 +705,7 @@ def issue_token(
     client_secret: str = Form(...),
     scope: str = Form("jobs.read"),
 ):
+
     if grant_type != "client_credentials":
         raise HTTPException(
             status_code=400,
@@ -550,7 +725,9 @@ def issue_token(
 
     requested_scopes = set(scope.split())
 
-    if not requested_scopes.issubset(client["scopes"]):
+    if not requested_scopes.issubset(
+        client["scopes"]
+    ):
         raise HTTPException(
             status_code=400,
             detail="invalid_scope",
@@ -569,12 +746,14 @@ def issue_token(
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": TOKEN_LIFETIME_SECONDS,
-        "scope": " ".join(sorted(requested_scopes)),
+        "scope": " ".join(
+            sorted(requested_scopes)
+        ),
     }
 
 
 # ==========================================
-# 20. OAuthトークン検証
+# 21. OAuth学習用トークン検証
 # ==========================================
 
 def verify_oauth_token(
@@ -582,6 +761,7 @@ def verify_oauth_token(
         security
     ),
 ):
+
     if credentials is None:
         raise HTTPException(
             status_code=401,
@@ -611,7 +791,7 @@ def verify_oauth_token(
 
 
 # ==========================================
-# 21. OAuth認証付き求人取得
+# 22. OAuth認証付き求人一覧
 # ==========================================
 
 @app.get(
@@ -621,6 +801,7 @@ def verify_oauth_token(
 def get_oauth_jobs(
     token_data: dict = Depends(verify_oauth_token),
 ):
+
     if "jobs.read" not in token_data["scopes"]:
         raise HTTPException(
             status_code=403,
@@ -631,7 +812,7 @@ def get_oauth_jobs(
 
 
 # ==========================================
-# 22. OAuth認証付き求人登録
+# 23. OAuth認証付き求人登録
 # ==========================================
 
 @app.post(
@@ -643,10 +824,11 @@ def create_oauth_job(
     job: JobInput,
     token_data: dict = Depends(verify_oauth_token),
 ):
+
     if "jobs.write" not in token_data["scopes"]:
         raise HTTPException(
             status_code=403,
             detail="jobs.writeスコープがありません",
         )
 
-    return create_job(job, _role="admin")
+    return insert_job(job)
