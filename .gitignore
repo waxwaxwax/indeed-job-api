@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+jobs.db
+logs/
+*.log
+main_backup.py
+.DS_Store
+
+# Local secrets and backups
+.env
+.env.*
+!.env.example
+jobs.db
+logs/
+.venv/
+__pycache__/
+*.pyc
+main_backup.py
+main_before_secure.py
+main_secure.py
+requirements-local.txt

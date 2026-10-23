@@ -1,0 +1,9 @@
+1. main_secure.py を main.py にリネームして既存の main.py と入れ替えます（先にバックアップ）。
+2. .env.example を .env にコピーし、ADMIN_TOKEN、READ_TOKEN、OAUTH_CLIENT_SECRET に推測困難な値を設定します。
+   生成例: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+3. python -m pip install -r requirements.txt
+4. python -m uvicorn main:app --reload
+5. GET /jobs は従来どおり利用できます。POST/PUT/DELETE /jobs は Authorization: Bearer <ADMIN_TOKEN> が必要です。
+6. 既存の test_frontend_crud.html は認証ヘッダーを付けないため書き込み時に401になります。次に画面側の認証対応を行います。
+7. .env、jobs.db、logs/、.venv/、main_backup.py は GitHub に含めないでください。
+注意: このOAuthは学習用の簡易実装であり、公開向けの認可サーバーではありません。Azure公開前に認証・永続化・HTTPS・運用設定を追加検討してください。

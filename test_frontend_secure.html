@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>求人管理システム | FastAPI + SQLite</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#233047;background:#f3f6fb}*{box-sizing:border-box}body{margin:0;padding:30px 16px}.wrap{max-width:1100px;margin:auto}.header{margin-bottom:22px}h1{margin:0 0 8px;font-size:28px}h2{font-size:19px;margin:0 0 18px}.muted{color:#64748b}.card{background:#fff;border:1px solid #e0e7ef;border-radius:14px;padding:24px;margin-bottom:18px;box-shadow:0 3px 14px #1e293b0a}.grid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:14px}.field label{display:block;font-size:13px;font-weight:650;margin-bottom:7px}.field input{width:100%;border:1px solid #cbd5e1;border-radius:8px;padding:12px;font-size:15px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}button{border:0;border-radius:8px;padding:11px 15px;cursor:pointer;font-weight:650;background:#1769d2;color:#fff}button:hover{filter:brightness(.93)}button:disabled{opacity:.5;cursor:wait}.secondary{background:#e8eef6;color:#1e3a5f}.danger{background:#c53030}.small{padding:7px 11px;font-size:13px}.status{margin:12px 0;padding:12px 14px;background:#eaf4ff;border-radius:8px;white-space:pre-wrap}.status.error{background:#fff0f0;color:#9f2424}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:680px}th,td{text-align:left;padding:13px;border-bottom:1px solid #e5eaf1}th{background:#f4f7fb;font-size:13px}td:last-child{white-space:nowrap}pre{background:#101c2c;color:#e2f0ff;border-radius:9px;padding:16px;overflow:auto;max-height:320px;line-height:1.5;font-size:13px}code{font-size:13px} .pill{display:inline-block;background:#e7f5eb;color:#206b3a;padding:5px 10px;border-radius:99px;font-size:12px}@media(max-width:700px){.grid{grid-template-columns:1fr}.card{padding:18px}h1{font-size:23px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="header"><h1>求人管理システム</h1><div class="muted">FastAPI + SQLite ｜ REST API実践ポートフォリオ（ローカル開発版）</div></header>
+<section class="card">
+<h2>管理者認証（ローカル学習用）</h2>
+<p class="muted">トークンはメモリ上のみで保持し、ページ更新時に消去します。公開サイトでは使用しないでください。</p>
+<div class="field"><label for="adminToken">Bearerトークン（ADMIN_TOKEN）</label><input id="adminToken" type="password" autocomplete="off" spellcheck="false" placeholder=".env の ADMIN_TOKEN を入力"></div>
+<div class="actions"><button id="clearTokenBtn" type="button" class="secondary">トークンを消去</button></div>
+</section>
+<section class="card">
+<h2 id="formTitle">求人を新規登録</h2>
+<form id="jobForm">
+<div class="grid">
+<div class="field"><label for="title">求人タイトル</label><input id="title" required maxlength="200" placeholder="例：Integration Support Analyst"></div>
+<div class="field"><label for="location">勤務地</label><input id="location" required maxlength="200" placeholder="例：Tokyo"></div>
+<div class="field"><label for="salary">給与（円）</label><input id="salary" type="number" min="0" max="1000000000" step="1" required placeholder="例：600000"></div>
+</div>
+<div class="actions"><button id="submitBtn" type="submit">求人を登録（POST）</button><button class="secondary" id="cancelBtn" type="button" hidden>編集をキャンセル</button></div>
+</form>
+</section>
+<section class="card">
+<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap"><h2 style="margin:0">求人一覧 <span id="count" class="pill">未取得</span></h2><button id="refreshBtn" class="secondary" type="button">一覧を再取得（GET）</button></div>
+<p id="status" class="status" role="status" aria-live="polite">APIへの接続待ちです。</p>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>求人タイトル</th><th>勤務地</th><th>給与（円）</th><th>操作</th></tr></thead><tbody id="jobTable"><tr><td colspan="5">読み込み中...</td></tr></tbody></table></div>
+</section>
+<section class="card"><h2>API通信結果</h2><p class="muted">HTTPステータス、X-Request-ID、レスポンス本文を表示します。ブラウザの開発者ツールでも確認できます。</p><pre id="apiResult">まだ通信していません。</pre></section>
+</div>
+<script>
+'use strict';
+const API_BASE_URL = 'http://127.0.0.1:8000';
+const $ = id => document.getElementById(id);
+let editingId = null;
+let busy = false;
+let currentJobs = [];
+let adminToken = '';
+$('adminToken').addEventListener('input', event => { adminToken = event.target.value.trim(); });
+$('clearTokenBtn').addEventListener('click', () => { adminToken = ''; $('adminToken').value = ''; setStatus('トークンを消去しました。'); });
+function setStatus(message, isError = false) { $('status').textContent = message; $('status').className = 'status' + (isError ? ' error' : ''); }
+function setBusy(value) { busy = value; $('submitBtn').disabled = value; $('refreshBtn').disabled = value; $('cancelBtn').disabled = value; document.querySelectorAll('.edit-btn,.delete-btn').forEach(btn => btn.disabled = value); }
+async function apiRequest(path, options = {}) {
+  let response;
+  const method = (options.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    if (!adminToken) throw new Error('書き込み操作には ADMIN_TOKEN が必要です。上の入力欄に設定してください。');
+    options = { ...options, headers: { ...(options.headers || {}), 'Authorization': 'Bearer ' + adminToken } };
+  }
+  try { response = await fetch(API_BASE_URL + path, options); }
+  catch (error) { $('apiResult').textContent = 'ネットワークエラー: ' + error.message; throw new Error('APIに接続できません。FastAPIが起動しているか、CORS設定を確認してください。'); }
+  const requestId = response.headers.get('X-Request-ID') || '(なし)';
+  const raw = await response.text();
+  let data;
+  try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+  $('apiResult').textContent = [
+    `${options.method || 'GET'} ${path}`,
+    `HTTP ${response.status} ${response.statusText}`,
+    `X-Request-ID: ${requestId}`,
+    '',
+    JSON.stringify(data, null, 2)
+  ].join('\n');
+  if (!response.ok) {
+    const detail = data && typeof data === 'object' ? data.detail : null;
+    const message = typeof detail === 'string' ? detail : JSON.stringify(detail || data);
+    const hint = response.status === 401 ? '（認証情報が無効または未設定です）' : response.status === 403 ? '（操作権限がありません）' : '';
+    throw new Error(`HTTP ${response.status}: ${message} ${hint}`);
+  }
+  return data;
+}
+function renderJobs(jobs) {
+  const tbody = $('jobTable'); tbody.replaceChildren();
+  $('count').textContent = `${jobs.length}件`;
+  if (!jobs.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 5; td.textContent = '求人はまだ登録されていません。'; tr.appendChild(td); tbody.appendChild(tr); return; }
+  jobs.forEach(job => {
+    const tr = document.createElement('tr');
+    [job.id, job.title, job.location, Number(job.salary).toLocaleString('ja-JP')].forEach(value => { const td = document.createElement('td'); td.textContent = String(value); tr.appendChild(td); });
+    const td = document.createElement('td');
+    const edit = document.createElement('button'); edit.type = 'button'; edit.className = 'small secondary edit-btn'; edit.textContent = '編集'; edit.addEventListener('click', () => startEdit(job));
+    const del = document.createElement('button'); del.type = 'button'; del.className = 'small danger delete-btn'; del.textContent = '削除'; del.style.marginLeft = '8px'; del.addEventListener('click', () => deleteJob(job));
+    td.append(edit, del); tr.appendChild(td); tbody.appendChild(tr);
+  });
+}
+async function loadJobs() {
+  if (busy) return;
+  setBusy(true); setStatus('求人一覧を取得しています...');
+  try { const jobs = await apiRequest('/jobs'); if (!Array.isArray(jobs)) throw new Error('レスポンスが配列ではありません。'); currentJobs = jobs; renderJobs(jobs); setStatus(`HTTP 200：求人を${jobs.length}件取得しました。`); }
+  catch (error) { setStatus(error.message, true); }
+  finally { setBusy(false); }
+}
+function resetForm() { editingId = null; $('jobForm').reset(); $('formTitle').textContent = '求人を新規登録'; $('submitBtn').textContent = '求人を登録（POST）'; $('cancelBtn').hidden = true; }
+function startEdit(job) { editingId = job.id; $('title').value = job.title; $('location').value = job.location; $('salary').value = job.salary; $('formTitle').textContent = `求人 ID ${job.id} を編集`; $('submitBtn').textContent = '変更を保存（PUT）'; $('cancelBtn').hidden = false; $('title').focus(); window.scrollTo({top: 0, behavior: 'smooth'}); }
+$('jobForm').addEventListener('submit', async event => {
+  event.preventDefault(); if (busy) return;
+  const title = $('title').value.trim(); const location = $('location').value.trim(); const salary = Number($('salary').value);
+  if (!title || !location || !Number.isSafeInteger(salary) || salary < 0) { setStatus('入力内容を確認してください。給与は0以上の整数にしてください。', true); return; }
+  const isEdit = editingId !== null; const path = isEdit ? `/jobs/${editingId}` : '/jobs'; const method = isEdit ? 'PUT' : 'POST';
+  setBusy(true); setStatus(`${method}リクエストを送信しています...`);
+  try { const result = await apiRequest(path, { method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify({title, location, salary}) }); resetForm(); setStatus(`HTTP ${isEdit ? 200 : 201}：求人 ID ${result.id} を${isEdit ? '更新' : '登録'}しました。`); }
+  catch (error) { setStatus(error.message, true); setBusy(false); return; }
+  setBusy(false); await loadJobs();
+});
+async function deleteJob(job) {
+  if (busy || !window.confirm(`求人 ID ${job.id}「${job.title}」を削除しますか？\nこの操作は取り消せません。`)) return;
+  setBusy(true); setStatus('DELETEリクエストを送信しています...');
+  try { await apiRequest(`/jobs/${job.id}`, {method: 'DELETE'}); if (editingId === job.id) resetForm(); setStatus(`求人 ID ${job.id} を削除しました。`); }
+  catch (error) { setStatus(error.message, true); setBusy(false); return; }
+  setBusy(false); await loadJobs();
+}
+$('refreshBtn').addEventListener('click', loadJobs);
+$('cancelBtn').addEventListener('click', resetForm);
+loadJobs();
+</script>
+</body>
+</html>
